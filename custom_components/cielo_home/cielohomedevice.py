@@ -95,6 +95,22 @@ class CieloHomeDevice:
         if self._device["latestAction"]["power"] == value:
             return
 
+        if self._is_ct01():
+            self._device["latestAction"]["power"] = value
+            if value == "off":
+                self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
+                    self._get_ct01_prefs().get("previousMode", 3), "auto"
+                )
+                action_str = self._build_ct01_action_string(mode=0)
+            else:
+                # Turn on to previous mode
+                prev = self._get_ct01_prefs().get("previousMode", 3)
+                mode_num = prev if prev != 0 else 3
+                self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(mode_num, "auto")
+                action_str = self._build_ct01_action_string(mode=mode_num)
+            self._send_ct01_command(action_str)
+            return
+
         action = self._get_action()
         action["power"] = value
         self._device["latestAction"]["power"] = value
@@ -316,6 +332,14 @@ class CieloHomeDevice:
 
     def _send_mode(self, value) -> None:
         """None."""
+        if self._is_ct01():
+            mode_num = self._CT01_MODE_TO_NUM.get(value, 3)
+            self._device["latestAction"]["power"] = "off" if mode_num == 0 else "on"
+            self._device["latestAction"]["mode"] = value
+            action_str = self._build_ct01_action_string(mode=mode_num)
+            self._send_ct01_command(action_str)
+            return
+
         if self.get_power() == "off":
             self.send_power_on()
             time.sleep(2)
@@ -429,6 +453,26 @@ class CieloHomeDevice:
 
     def send_temperature(self, value) -> None:
         """None."""
+        if self._is_ct01():
+            temp_str = str(int(value))
+            self._device["latestAction"]["temp"] = temp_str
+            mode = self.get_mode()
+            if mode == "cool":
+                action_str = self._build_ct01_action_string(
+                    cool_sp=temp_str, auto_cool_sp=temp_str
+                )
+            elif mode in ("heat", "freezepoint"):
+                action_str = self._build_ct01_action_string(
+                    heat_sp=temp_str, auto_heat_sp=temp_str
+                )
+            else:
+                # auto mode — set the cool setpoint (more common use case in PR)
+                action_str = self._build_ct01_action_string(
+                    auto_cool_sp=temp_str
+                )
+            self._send_ct01_command(action_str)
+            return
+
         actionValue = value
         temp = int(self._device["latestAction"]["temp"])
         if temp == int(value) and self.get_supportTargetTemp():
@@ -1059,47 +1103,166 @@ class CieloHomeDevice:
             or self.get_device_type_version().startswith("CT")
         )
 
+    # --- CT01 thermostat command support ---
+
+    _CT01_MODE_TO_NUM = {"off": 0, "heat": 1, "cool": 2, "auto": 3}
+    _CT01_NUM_TO_MODE = {0: "off", 1: "heat", 2: "cool", 3: "auto", 4: "heat"}
+
+    def _get_ct01_prefs(self):
+        """Get CT01 preferences, falling back to synthesised latestAction."""
+        return self._device.get("preferences", {})
+
+    def _build_ct01_action_string(
+        self,
+        mode: int | None = None,
+        heat_sp: str | None = None,
+        cool_sp: str | None = None,
+        auto_heat_sp: str | None = None,
+        auto_cool_sp: str | None = None,
+    ) -> str:
+        """Build a CT01 action_string from current state + overrides.
+
+        Format: S,{preset},{mode},{heatSP},{coolSP},{autoHeatSP},{autoCoolSP},
+                  {fanHeat},{auxStage},{fanTimer},{holdActive},{fanCool},
+                  {f12},{f13},{f14},{f15},{f16},
+        """
+        prefs = self._get_ct01_prefs()
+        manual = prefs.get("manualSettings", {})
+
+        p_mode = mode if mode is not None else prefs.get("mode", 0)
+        p_heat = heat_sp or str(manual.get("heatSetPoint", "65.0"))
+        p_cool = cool_sp or str(manual.get("coolSetPoint", "73.0"))
+        p_aheat = auto_heat_sp or str(manual.get("autoHeatSetPoint", "65.0"))
+        p_acool = auto_cool_sp or str(manual.get("autoCoolSetPoint", "73.0"))
+        p_fan_heat = manual.get("fanHeat", 2)
+        p_fan_cool = manual.get("fanCool", 2)
+        p_aux = prefs.get("auxStage", 0)
+        p_fan_timer = prefs.get("fanTimerDuration", 15)
+        p_hold = prefs.get("holdSettingsActive", 0)
+
+        fields = [
+            "S",
+            str(prefs.get("activePresetId", 0)),
+            str(p_mode),
+            p_heat,
+            p_cool,
+            p_aheat,
+            p_acool,
+            str(p_fan_heat),
+            str(p_aux),
+            str(p_fan_timer),
+            str(p_hold),
+            str(p_fan_cool),
+            str(prefs.get("coolingSmartRecovery", 0)),
+            str(prefs.get("heatingSmartRecovery", 0)),
+            "0",
+            "0",
+            str(prefs.get("previousMode", 0)),
+            "",  # trailing comma
+        ]
+        return ",".join(fields)
+
+    def _send_ct01_command(self, action_string: str) -> None:
+        """Send a thermostatActions command for CT01 devices."""
+        msg = {
+            "action": "thermostatActions",
+            "deviceTypeVersion": self.get_device_type_version(),
+            "user_id": self._user_id,
+            "mac_address": self.get_mac_address(),
+            "connection_source": self._connection_source
+            if self._force_connection_source
+            else self.get_connection_source(),
+            "application_version": "1.4.7",
+            "action_string": action_string,
+            "mid": "WEB",
+            "ts": 0,
+        }
+        _LOGGER.debug("CT01 command: %s", action_string)
+        self._api.send_action(msg)
+
     def _data_receive_ct01(self, data) -> None:
         """Handle CT01 thermostat state updates.
 
-        CT01 WebSocket messages may use 'preferences'-style fields instead
-        of the Breez 'action' dict. We normalise into latestAction.
+        CT01 StateUpdate uses action.equipment_power, action.mode (numeric),
+        and action.manual_settings — completely different from Breez format.
         """
-        _MODE_MAP = {0: "off", 1: "heat", 2: "cool", 3: "auto", 4: "heat"}
-
         with contextlib.suppress(KeyError):
             self._device["latEnv"]["temp"] = data["lat_env_var"]["temperature"]
             self._device["latEnv"]["humidity"] = data["lat_env_var"]["humidity"]
 
         self._device["deviceStatus"] = data.get("device_status", self._device.get("deviceStatus", 1))
 
-        # CT01 might send Breez-style 'action' or thermostat-style fields
         action = data.get("action", {})
-        if "power" in action:
-            # Breez-compatible format — use directly
-            self._device["latestAction"]["power"] = action["power"]
-            self._old_power = action["power"]
-            with contextlib.suppress(KeyError):
-                self._device["latestAction"]["mode"] = action["mode"]
-            with contextlib.suppress(KeyError):
-                self._device["latestAction"]["temp"] = action["temp"]
-            with contextlib.suppress(KeyError):
-                self._device["latestAction"]["fanspeed"] = action["fanspeed"]
-        elif "equipmentPower" in data or "mode" in data:
-            # CT01-native format
-            power = data.get("equipmentPower", self._device["latestAction"]["power"])
+
+        # CT01 StateUpdate has equipment_power, mode (numeric), manual_settings
+        if "equipment_power" in action:
+            power = action["equipment_power"]
             self._device["latestAction"]["power"] = power
             self._old_power = power
 
-            mode_num = data.get("mode", 0)
-            if isinstance(mode_num, int):
-                self._device["latestAction"]["mode"] = _MODE_MAP.get(mode_num, "auto")
+            mode_num = action.get("mode", 0)
+            if isinstance(mode_num, (int, str)):
+                mode_num = int(mode_num)
+                mode_str = self._CT01_NUM_TO_MODE.get(mode_num, "auto")
+                self._device["latestAction"]["mode"] = mode_str
 
-            with contextlib.suppress(KeyError):
-                if data.get("mode", -1) == 2:
-                    self._device["latestAction"]["temp"] = str(data["coolSetPoint"]).replace(".0", "")
-                elif data.get("mode", -1) in (1, 4):
-                    self._device["latestAction"]["temp"] = str(data["heatSetPoint"]).replace(".0", "")
+            # Update target temp from manual_settings
+            manual = action.get("manual_settings", {})
+            if manual:
+                if mode_num == 2:  # cool
+                    sp = manual.get("cool_set_point", manual.get("auto_cool_set_point"))
+                elif mode_num in (1, 4):  # heat
+                    sp = manual.get("heat_set_point", manual.get("auto_heat_set_point"))
+                elif mode_num == 3:  # auto
+                    sp = manual.get("auto_cool_set_point")
+                else:
+                    sp = manual.get("cool_set_point")
+
+                if sp is not None:
+                    self._device["latestAction"]["temp"] = str(sp).replace(".0", "")
+
+            # Update fan
+            fan_num = action.get("fan", 0)
+            self._device["latestAction"]["fanspeed"] = "low" if fan_num == 1 else "auto"
+
+            # Persist preferences so _build_ct01_action_string stays current
+            prefs = self._device.get("preferences", {})
+            prefs["equipmentPower"] = power
+            prefs["mode"] = mode_num
+            prefs.update({
+                k: action[k] for k in (
+                    "active_preset_id", "hold_settings_active", "fan",
+                    "previous_mode", "aux_stage", "fan_timer_duration",
+                    "cooling_smart_recovery", "heating_smart_recovery",
+                ) if k in action
+            })
+            # Map snake_case manual_settings back to camelCase preferences
+            if manual:
+                pm = prefs.setdefault("manualSettings", {})
+                _SNAKE_TO_CAMEL = {
+                    "heat_set_point": "heatSetPoint",
+                    "cool_set_point": "coolSetPoint",
+                    "auto_heat_set_point": "autoHeatSetPoint",
+                    "auto_cool_set_point": "autoCoolSetPoint",
+                    "fan_heat": "fanHeat",
+                    "fan_cool": "fanCool",
+                }
+                for sk, ck in _SNAKE_TO_CAMEL.items():
+                    if sk in manual:
+                        pm[ck] = manual[sk]
+            # Also sync snake_case prefs keys to camelCase
+            _PREF_MAP = {
+                "active_preset_id": "activePresetId",
+                "hold_settings_active": "holdSettingsActive",
+                "previous_mode": "previousMode",
+                "aux_stage": "auxStage",
+                "fan_timer_duration": "fanTimerDuration",
+                "cooling_smart_recovery": "coolingSmartRecovery",
+                "heating_smart_recovery": "heatingSmartRecovery",
+            }
+            for sk, ck in _PREF_MAP.items():
+                if sk in action:
+                    prefs[ck] = action[sk]
 
     def data_receive(self, data) -> None:
         """None."""
