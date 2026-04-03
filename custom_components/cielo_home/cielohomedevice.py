@@ -604,9 +604,9 @@ class CieloHomeDevice:
         """None."""
         return self._device["fwVersion"]
 
-    def get_appliance_id(self) -> int:
+    def get_appliance_id(self):
         """None."""
-        return self._device["applianceId"]
+        return self._device.get("applianceId", 0)
 
     def get_my_rule_configuration(self) -> any:
         """None."""
@@ -673,7 +673,7 @@ class CieloHomeDevice:
 
     def get_appliance_type(self) -> str:
         """None."""
-        return self._device["applianceType"]
+        return self._device.get("applianceType", "")
 
     def get_device(self):
         """None."""
@@ -1052,9 +1052,65 @@ class CieloHomeDevice:
         else:
             pass
 
+    def _is_ct01(self) -> bool:
+        """Check if this device is a CT01 wired thermostat."""
+        return (
+            self._device.get("deviceType") == "THERMOSTAT"
+            or self.get_device_type_version().startswith("CT")
+        )
+
+    def _data_receive_ct01(self, data) -> None:
+        """Handle CT01 thermostat state updates.
+
+        CT01 WebSocket messages may use 'preferences'-style fields instead
+        of the Breez 'action' dict. We normalise into latestAction.
+        """
+        _MODE_MAP = {0: "off", 1: "heat", 2: "cool", 3: "auto", 4: "heat"}
+
+        with contextlib.suppress(KeyError):
+            self._device["latEnv"]["temp"] = data["lat_env_var"]["temperature"]
+            self._device["latEnv"]["humidity"] = data["lat_env_var"]["humidity"]
+
+        self._device["deviceStatus"] = data.get("device_status", self._device.get("deviceStatus", 1))
+
+        # CT01 might send Breez-style 'action' or thermostat-style fields
+        action = data.get("action", {})
+        if "power" in action:
+            # Breez-compatible format — use directly
+            self._device["latestAction"]["power"] = action["power"]
+            self._old_power = action["power"]
+            with contextlib.suppress(KeyError):
+                self._device["latestAction"]["mode"] = action["mode"]
+            with contextlib.suppress(KeyError):
+                self._device["latestAction"]["temp"] = action["temp"]
+            with contextlib.suppress(KeyError):
+                self._device["latestAction"]["fanspeed"] = action["fanspeed"]
+        elif "equipmentPower" in data or "mode" in data:
+            # CT01-native format
+            power = data.get("equipmentPower", self._device["latestAction"]["power"])
+            self._device["latestAction"]["power"] = power
+            self._old_power = power
+
+            mode_num = data.get("mode", 0)
+            if isinstance(mode_num, int):
+                self._device["latestAction"]["mode"] = _MODE_MAP.get(mode_num, "auto")
+
+            with contextlib.suppress(KeyError):
+                if data.get("mode", -1) == 2:
+                    self._device["latestAction"]["temp"] = str(data["coolSetPoint"]).replace(".0", "")
+                elif data.get("mode", -1) in (1, 4):
+                    self._device["latestAction"]["temp"] = str(data["heatSetPoint"]).replace(".0", "")
+
     def data_receive(self, data) -> None:
         """None."""
         if data["mac_address"] == self.get_mac_address():
+            if self._is_ct01():
+                with contextlib.suppress(Exception):
+                    if data.get("message_type") in ("StateUpdate", "DeviceSettingsAck"):
+                        self._data_receive_ct01(data)
+                self.dispatch_state_timer()
+                return
+
             with contextlib.suppress(KeyError):
                 if data["message_type"] == "StateUpdate":
                     self._device["latEnv"]["temp"] = data["lat_env_var"]["temperature"]

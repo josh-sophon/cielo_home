@@ -403,6 +403,119 @@ class CieloHome:
         return int(datetime.now().timestamp())
         # return int((datetime.utcnow() - datetime.fromtimestamp(0)).total_seconds())
 
+    @staticmethod
+    def _adapt_ct01_device(device):
+        """Transform CT01 wired thermostat data into Breez-compatible format.
+
+        CT01 devices use 'preferences' instead of 'latestAction' and have no
+        applianceId (they control HVAC via wiring, not IR). This synthesises the
+        fields that CieloHomeDevice expects so the rest of the code works
+        unchanged.
+        """
+        prefs = device.get("preferences", {})
+        manual = prefs.get("manualSettings", {})
+        equip = device.get("equipmentSettings", {})
+
+        # --- mode mapping (CT01 numeric → Breez string) ---
+        _MODE_MAP = {0: "off", 1: "heat", 2: "cool", 3: "auto", 4: "heat"}
+        mode_num = prefs.get("mode", 0)
+        power = prefs.get("equipmentPower", "off")
+
+        mode_str = _MODE_MAP.get(mode_num, "auto")
+        if power == "off":
+            # When off, keep previous mode for display
+            mode_str = _MODE_MAP.get(prefs.get("previousMode", 3), "auto")
+
+        # --- target temperature (depends on active mode) ---
+        if mode_num == 2:
+            target = manual.get("coolSetPoint", "73")
+        elif mode_num in (1, 4):
+            target = manual.get("heatSetPoint", "65")
+        elif mode_num == 3:
+            target = manual.get("autoCoolSetPoint", "73")
+        else:
+            target = manual.get("coolSetPoint", "73")
+
+        target_str = str(target).replace(".0", "")
+
+        # --- fan mapping (CT01: 0/2=auto, 1=on) ---
+        fan_num = prefs.get("fan", 0)
+        fan_str = "low" if fan_num == 1 else "auto"
+
+        # --- synthesise latestAction ---
+        device["latestAction"] = {
+            "power": power,
+            "mode": mode_str,
+            "temp": target_str,
+            "fanspeed": fan_str,
+            "swing": "",
+            "turbo": "off",
+            "light": "off",
+            "followme": "off",
+            "preset": 0,
+        }
+
+        # --- synthesise appliance capabilities ---
+        heat_range = prefs.get("heatLimit", "45:90").replace(".0", "")
+        cool_range = prefs.get("coolLimit", "45:90").replace(".0", "")
+
+        # Use the wider of the two ranges
+        try:
+            h_lo, h_hi = heat_range.split(":")
+            c_lo, c_hi = cool_range.split(":")
+            range_lo = min(int(float(h_lo)), int(float(c_lo)))
+            range_hi = max(int(float(h_hi)), int(float(c_hi)))
+            temp_range = f"{range_lo}:{range_hi}"
+        except Exception:
+            temp_range = "45:90"
+
+        # Determine available modes from equipment type
+        equip_type = equip.get("equipmentType", 1)
+        if equip_type == 1:  # heat pump
+            modes = "heat:cool:auto"
+        elif equip_type == 2:  # conventional heat + cool
+            modes = "heat:cool:auto"
+        elif equip_type == 3:  # cool only
+            modes = "cool"
+        else:
+            modes = "heat:cool:auto"
+
+        device["appliance"] = {
+            "applianceId": "CT01",
+            "mode": modes,
+            "fan": "auto:low" if fan_num in (0, 1, 2) else "",
+            "temp": temp_range,
+            "tempIncrement": 1,
+            "isFaren": device.get("isFaren", 1),
+            "swing": "",
+            "turbo": "",
+            "isDisplayLight": 0,
+            "followme": "",
+            "isFreezepointDisplay": 0,
+            "isMultiModeTempRange": 0,
+        }
+
+        # --- fill in missing fields the device class expects ---
+        device.setdefault("applianceId", "CT01")
+        device.setdefault("applianceType", "THERMOSTAT")
+        device.setdefault("connectionSource", 1)
+        device.setdefault("myRuleConfiguration", {})
+        device.setdefault("deviceSettings", {
+            "screenDisplayValue": "",
+            "brightnessValue": "",
+            "idleScreenTimeout": "",
+            "idleBrightnessValue": "",
+        })
+
+        _LOGGER.info(
+            "CT01 thermostat '%s' adapted: power=%s mode=%s temp=%s",
+            device.get("deviceName", "?"),
+            power,
+            mode_str,
+            target_str,
+        )
+        return device
+
     async def async_get_devices(self):
         """None."""
         devices = await self.async_get_thermostats()
@@ -413,9 +526,17 @@ class CieloHome:
 
         if devices is not None:
             for device in devices:
-                appliance_id: str = str(device["applianceId"])
+                appliance_id: str = str(device.get("applianceId", ""))
                 if appliance_id in ("0", ""):
-                    devicesNotSupported.append(device)
+                    # Check if this is a CT01 wired thermostat
+                    if device.get("deviceType") == "THERMOSTAT" or device.get("deviceTypeVersion", "").startswith("CT"):
+                        self._adapt_ct01_device(device)
+                        _LOGGER.info(
+                            "CT01 device '%s' included via adapter",
+                            device.get("deviceName", "Unknown"),
+                        )
+                    else:
+                        devicesNotSupported.append(device)
                     continue
 
                 # Only add to appliance_ids string if we haven't seen this appliance ID before
@@ -425,7 +546,11 @@ class CieloHome:
                         appliance_ids = appliance_ids + ","
                     appliance_ids = appliance_ids + str(appliance_id)
 
-            appliances = await self.async_get_thermostat_info(appliance_ids)
+            # Fetch appliance data for Breez devices (CT01 already has synthetic data)
+            if appliance_ids:
+                appliances = await self.async_get_thermostat_info(appliance_ids)
+            else:
+                appliances = []
 
             if len(devicesNotSupported) > 0:
                 for device in devicesNotSupported:
@@ -433,13 +558,17 @@ class CieloHome:
                         "Device '"
                         + str(device["deviceName"])
                         + "' not supported, invalid appliance '"
-                        + str(device["applianceId"])
+                        + str(device.get("applianceId", ""))
                         + "'"
                     )
                     devices.remove(device)
 
             # Attach appliance data to ALL devices, even those sharing the same appliance ID
             for device in devices:
+                # Skip CT01 devices — they already have synthetic appliance data
+                if "appliance" in device:
+                    continue
+
                 device_appliance_id = device["applianceId"]
                 appliance_attached = False
                 for appliance in appliances:
@@ -466,6 +595,13 @@ class CieloHome:
         for listener in self.__event_listener:
             for device in devices:
                 if device["macAddress"] == listener.get_mac_address():
+                    # Re-adapt CT01 devices on state refresh
+                    is_ct01 = (
+                        device.get("deviceType") == "THERMOSTAT"
+                        or device.get("deviceTypeVersion", "").startswith("CT")
+                    )
+                    if is_ct01 and "latestAction" not in device:
+                        self._adapt_ct01_device(device)
                     listener.state_device_receive(device)
 
     async def async_get_thermostats(self):
@@ -532,7 +668,11 @@ class CieloHome:
             for device in devices:
                 try:
                     appliance_id: str = str(device.get("applianceId", ""))
-                    if appliance_id and appliance_id != "0":
+                    is_ct01 = (
+                        device.get("deviceType") == "THERMOSTAT"
+                        or device.get("deviceTypeVersion", "").startswith("CT")
+                    )
+                    if (appliance_id and appliance_id != "0") or is_ct01:
                         devices_supported.append(device)
                     else:
                         _LOGGER.warning(
