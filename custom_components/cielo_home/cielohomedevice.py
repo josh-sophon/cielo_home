@@ -96,17 +96,11 @@ class CieloHomeDevice:
             return
 
         if self._is_ct01():
-            self._device["latestAction"]["power"] = value
             if value == "off":
-                self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
-                    self._get_ct01_prefs().get("previousMode", 3), "auto"
-                )
+                self._ct01_prepare_action_state(power=False)
                 action_str = self._build_ct01_action_string(mode=0)
             else:
-                # Turn on to previous mode
-                prev = self._get_ct01_prefs().get("previousMode", 3)
-                mode_num = prev if prev != 0 else 3
-                self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(mode_num, "auto")
+                mode_num = self._ct01_prepare_action_state(power=True)
                 action_str = self._build_ct01_action_string(mode=mode_num)
             self._send_ct01_command(action_str)
             return
@@ -145,6 +139,28 @@ class CieloHomeDevice:
         self, power: bool, temp: int, mode: str, fan_speed: str, swing: str, preset: str
     ) -> None:
         """None."""
+        if self._is_ct01():
+            mode_num = self._ct01_mode_num(mode, self._ct01_current_non_off_mode())
+            if power:
+                mode_num = self._ct01_prepare_action_state(
+                    power=True,
+                    mode_num=mode_num,
+                    temp=temp if temp and temp > 0 else None,
+                )
+            else:
+                mode_num = self._ct01_prepare_action_state(power=False)
+
+            action_str = self._build_ct01_action_string(mode=mode_num if power else 0)
+            _LOGGER.debug(
+                "CT01 sync_ac_state command power=%s mode=%s temp=%s action_string=%s",
+                power,
+                self._CT01_NUM_TO_MODE.get(mode_num, "auto"),
+                temp,
+                action_str,
+            )
+            self._send_ct01_command(action_str)
+            return
+
         action = self._get_action()
         action = {
             "power": "on" if power else "off",
@@ -334,8 +350,7 @@ class CieloHomeDevice:
         """None."""
         if self._is_ct01():
             mode_num = self._CT01_MODE_TO_NUM.get(value, 3)
-            self._device["latestAction"]["power"] = "off" if mode_num == 0 else "on"
-            self._device["latestAction"]["mode"] = value
+            self._ct01_prepare_action_state(power=mode_num != 0, mode_num=mode_num)
             action_str = self._build_ct01_action_string(mode=mode_num)
             self._send_ct01_command(action_str)
             return
@@ -454,9 +469,10 @@ class CieloHomeDevice:
     def send_temperature(self, value) -> None:
         """None."""
         if self._is_ct01():
-            temp_str = str(int(value))
-            self._device["latestAction"]["temp"] = temp_str
             mode = self.get_mode()
+            mode_num = self._ct01_mode_num(mode, self._ct01_current_non_off_mode())
+            self._ct01_update_setpoint(mode_num, int(value))
+            temp_str = str(int(value))
             if mode == "cool":
                 action_str = self._build_ct01_action_string(
                     cool_sp=temp_str, auto_cool_sp=temp_str
@@ -1112,6 +1128,113 @@ class CieloHomeDevice:
         """Get CT01 preferences, falling back to synthesised latestAction."""
         return self._device.get("preferences", {})
 
+    @staticmethod
+    def _ct01_int(value, default: int = 0) -> int:
+        """Coerce CT01 numeric fields that can arrive as strings/floats."""
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _ct01_pref(self, camel_key: str, snake_key: str, default):
+        """Read CT01 prefs regardless of API camelCase/snake_case shape."""
+        prefs = self._get_ct01_prefs()
+        if camel_key in prefs:
+            return prefs[camel_key]
+        if snake_key in prefs:
+            return prefs[snake_key]
+        return default
+
+    def _ct01_mode_num(self, value, default: int = 3) -> int:
+        """Map CT01 mode strings/enums/numbers to the thermostat numeric mode."""
+        if value in (None, ""):
+            return default
+        if hasattr(value, "value"):
+            value = value.value
+        if isinstance(value, int):
+            return value
+        coerced = self._ct01_int(value, -1)
+        if coerced >= 0 and str(value).replace(".", "", 1).isdigit():
+            return coerced
+        return self._CT01_MODE_TO_NUM.get(value, default)
+
+    def _ct01_current_non_off_mode(self, fallback: int = 3) -> int:
+        """Return the best current/remembered non-off CT01 mode."""
+        latest_mode = self._device.get("latestAction", {}).get("mode")
+        latest_mode_num = self._ct01_mode_num(latest_mode, 0)
+        if latest_mode_num:
+            return latest_mode_num
+
+        prefs = self._get_ct01_prefs()
+        mode_num = self._ct01_int(prefs.get("mode"), 0)
+        if mode_num:
+            return mode_num
+
+        previous_mode = self._ct01_int(
+            self._ct01_pref("previousMode", "previous_mode", 0), 0
+        )
+        if previous_mode:
+            return previous_mode
+
+        return fallback
+
+    def _ct01_set_previous_mode(self, mode_num: int) -> None:
+        """Persist previous mode in both key styles used by CT01 payloads."""
+        prefs = self._get_ct01_prefs()
+        if mode_num:
+            prefs["previousMode"] = mode_num
+            prefs["previous_mode"] = mode_num
+
+    def _ct01_update_setpoint(self, mode_num: int, temp: int) -> None:
+        """Persist a CT01 target into latestAction and manual settings."""
+        temp_str = str(int(temp))
+        self._device["latestAction"]["temp"] = temp_str
+
+        manual = self._get_ct01_prefs().setdefault("manualSettings", {})
+        if mode_num == 2:
+            manual["coolSetPoint"] = temp_str
+            manual["autoCoolSetPoint"] = temp_str
+        elif mode_num in (1, 4):
+            manual["heatSetPoint"] = temp_str
+            manual["autoHeatSetPoint"] = temp_str
+        elif mode_num == 3:
+            manual["autoCoolSetPoint"] = temp_str
+        else:
+            manual["coolSetPoint"] = temp_str
+
+    def _ct01_prepare_action_state(
+        self, *, power: bool, mode_num: int | None = None, temp: int | None = None
+    ) -> int:
+        """Update local CT01 prefs/latestAction before building action_string."""
+        prefs = self._get_ct01_prefs()
+        command_mode = self._ct01_int(mode_num, 0) if mode_num is not None else 0
+
+        if power:
+            if command_mode == 0:
+                command_mode = self._ct01_current_non_off_mode()
+            prefs["equipmentPower"] = "on"
+            prefs["mode"] = command_mode
+            self._ct01_set_previous_mode(command_mode)
+            self._device["latestAction"]["power"] = "on"
+            self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
+                command_mode, "auto"
+            )
+        else:
+            previous_mode = self._ct01_current_non_off_mode()
+            prefs["equipmentPower"] = "off"
+            prefs["mode"] = 0
+            self._ct01_set_previous_mode(previous_mode)
+            self._device["latestAction"]["power"] = "off"
+            self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
+                previous_mode, "auto"
+            )
+            command_mode = 0
+
+        if temp and temp > 0:
+            self._ct01_update_setpoint(command_mode, temp)
+
+        return command_mode
+
     def _build_ct01_action_string(
         self,
         mode: int | None = None,
@@ -1129,20 +1252,28 @@ class CieloHomeDevice:
         prefs = self._get_ct01_prefs()
         manual = prefs.get("manualSettings", {})
 
-        p_mode = mode if mode is not None else prefs.get("mode", 0)
+        p_mode = mode if mode is not None else self._ct01_int(prefs.get("mode"), 0)
+        previous_mode = self._ct01_int(
+            self._ct01_pref("previousMode", "previous_mode", 0), 0
+        )
+        if p_mode:
+            previous_mode = p_mode
+        elif not previous_mode:
+            previous_mode = self._ct01_current_non_off_mode()
+
         p_heat = heat_sp or str(manual.get("heatSetPoint", "65.0"))
         p_cool = cool_sp or str(manual.get("coolSetPoint", "73.0"))
         p_aheat = auto_heat_sp or str(manual.get("autoHeatSetPoint", "65.0"))
         p_acool = auto_cool_sp or str(manual.get("autoCoolSetPoint", "73.0"))
         p_fan_heat = manual.get("fanHeat", 2)
         p_fan_cool = manual.get("fanCool", 2)
-        p_aux = prefs.get("auxStage", 0)
-        p_fan_timer = prefs.get("fanTimerDuration", 15)
-        p_hold = prefs.get("holdSettingsActive", 0)
+        p_aux = self._ct01_pref("auxStage", "aux_stage", 0)
+        p_fan_timer = self._ct01_pref("fanTimerDuration", "fan_timer_duration", 15)
+        p_hold = self._ct01_pref("holdSettingsActive", "hold_settings_active", 0)
 
         fields = [
             "S",
-            str(prefs.get("activePresetId", 0)),
+            str(self._ct01_pref("activePresetId", "active_preset_id", 0)),
             str(p_mode),
             p_heat,
             p_cool,
@@ -1153,11 +1284,11 @@ class CieloHomeDevice:
             str(p_fan_timer),
             str(p_hold),
             str(p_fan_cool),
-            str(prefs.get("coolingSmartRecovery", 0)),
-            str(prefs.get("heatingSmartRecovery", 0)),
+            str(self._ct01_pref("coolingSmartRecovery", "cooling_smart_recovery", 0)),
+            str(self._ct01_pref("heatingSmartRecovery", "heating_smart_recovery", 0)),
             "0",
             "0",
-            str(prefs.get("previousMode", 0)),
+            str(previous_mode),
             "",  # trailing comma
         ]
         return ",".join(fields)

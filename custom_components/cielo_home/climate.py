@@ -167,6 +167,8 @@ class CieloHomeThermostat(CieloHomeEntity, ClimateEntity):
     ) -> None:
         """Sync_ac_state."""
         self._device.sync_ac_state(power, temp, mode, fan_speed, swing, preset)
+        self._update_internal_state()
+        self.schedule_update_ha_state(False)
 
     def set_swing_mode(self, swing_mode: str) -> None:
         """Set new target swing operation."""
