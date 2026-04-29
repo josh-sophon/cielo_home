@@ -419,12 +419,10 @@ class CieloHome:
         # --- mode mapping (CT01 numeric → Breez string) ---
         _MODE_MAP = {0: "off", 1: "heat", 2: "cool", 3: "auto", 4: "heat"}
         mode_num = prefs.get("mode", 0)
-        power = prefs.get("equipmentPower", "off")
+        equipment_power = prefs.get("equipmentPower", "off")
+        control_power = "off" if mode_num == 0 else "on"
 
         mode_str = _MODE_MAP.get(mode_num, "auto")
-        if power == "off":
-            # When off, keep previous mode for display
-            mode_str = _MODE_MAP.get(prefs.get("previousMode", 3), "auto")
 
         # --- target temperature (depends on active mode) ---
         if mode_num == 2:
@@ -444,7 +442,8 @@ class CieloHome:
 
         # --- synthesise latestAction ---
         device["latestAction"] = {
-            "power": power,
+            "power": control_power,
+            "equipment_power": equipment_power,
             "mode": mode_str,
             "temp": target_str,
             "fanspeed": fan_str,

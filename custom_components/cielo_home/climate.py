@@ -194,6 +194,7 @@ class CieloHomeThermostat(CieloHomeEntity, ClimateEntity):
         if self._attr_preset_modes is not None:
             self._attr_preset_mode = self._device.get_preset_mode()
         self._attr_hvac_mode = self._device.get_hvac_mode()
+        self._attr_hvac_action = self._device.get_hvac_action()
 
         if self._device.get_supportTargetTemp() and self._device.get_max_temp() > 0:
             self._attr_max_temp = self._device.get_max_temp()

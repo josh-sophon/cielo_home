@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Separate CT01 requested thermostat mode from transient equipment runtime, exposing runtime through `hvac_action`.
 - Keep CT01 `previousMode` and local preferences coherent before sending thermostat action strings.
 - Update `sync_ac_state` climate service state after CT01 commands so Home Assistant can report the immediate command result before cloud readback settles.
 

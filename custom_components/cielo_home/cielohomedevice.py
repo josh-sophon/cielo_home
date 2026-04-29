@@ -7,7 +7,7 @@ import sys
 from threading import Lock, Timer
 import time
 
-from homeassistant.components.climate import HVACMode
+from homeassistant.components.climate import HVACAction, HVACMode
 from homeassistant.const import UnitOfTemperature
 
 from .cielohome import CieloHome
@@ -745,7 +745,22 @@ class CieloHomeDevice:
 
     def get_power(self) -> str:
         """None."""
+        if self._is_ct01():
+            return "off" if self._ct01_state_mode_num() == 0 else "on"
         return self._device["latestAction"]["power"]
+
+    def get_equipment_power(self) -> str:
+        """Return CT01 runtime equipment demand separately from thermostat mode."""
+        if not self._is_ct01():
+            return self._device["latestAction"]["power"]
+        latest = self._device.get("latestAction", {})
+        prefs = self._get_ct01_prefs()
+        return str(
+            latest.get("equipment_power")
+            or prefs.get("equipmentPower")
+            or prefs.get("equipment_power")
+            or "off"
+        )
 
     def get_follow_me(self) -> str:
         """None."""
@@ -902,20 +917,44 @@ class CieloHomeDevice:
 
     def get_hvac_mode(self) -> str:
         """None."""
-        if self.get_power() == "off":
+        mode = self.get_mode()
+        if self._is_ct01():
+            mode = self._CT01_NUM_TO_MODE.get(self._ct01_state_mode_num(), mode)
+        elif self.get_power() == "off":
             return HVACMode.OFF
-        elif self.get_mode() == "auto":
+
+        if mode == "off":
+            return HVACMode.OFF
+        elif mode == "auto":
             return HVACMode.AUTO
-        elif self.get_mode() == "heat" or self.get_mode() == "freezepoint":
+        elif mode == "heat" or mode == "freezepoint":
             return HVACMode.HEAT
-        elif self.get_mode() == "cool" or self.get_mode() == "mode":
+        elif mode == "cool" or mode == "mode":
             return HVACMode.COOL
-        elif self.get_mode() == "dry":
+        elif mode == "dry":
             return HVACMode.DRY
-        elif self.get_mode() == "fan":
+        elif mode == "fan":
             return HVACMode.FAN_ONLY
         else:
             return HVACMode.OFF
+
+    def get_hvac_action(self) -> HVACAction | None:
+        """Return CT01 runtime action without collapsing active modes to off."""
+        mode = self.get_hvac_mode()
+        if mode == HVACMode.OFF:
+            return HVACAction.OFF
+        if not self._is_ct01():
+            return None
+
+        if self.get_equipment_power() != "on":
+            return HVACAction.IDLE
+        if mode == HVACMode.COOL:
+            return HVACAction.COOLING
+        if mode == HVACMode.HEAT:
+            return HVACAction.HEATING
+        if mode == HVACMode.AUTO:
+            return self._ct01_auto_hvac_action()
+        return HVACAction.IDLE
 
     def get_hvac_modes(self) -> list[str]:
         """None."""
@@ -1178,6 +1217,33 @@ class CieloHomeDevice:
 
         return fallback
 
+    def _ct01_state_mode_num(self) -> int:
+        """Return the requested CT01 thermostat mode, not equipment runtime."""
+        prefs = self._get_ct01_prefs()
+        if "mode" in prefs:
+            return self._ct01_int(prefs.get("mode"), 0)
+        latest_mode = self._device.get("latestAction", {}).get("mode")
+        return self._ct01_mode_num(latest_mode, 0)
+
+    def _ct01_auto_hvac_action(self) -> HVACAction:
+        """Infer the active auto call direction from temperature/setpoints."""
+        manual = self._get_ct01_prefs().get("manualSettings", {})
+        current = self.get_current_temperature()
+        try:
+            cool = float(manual.get("autoCoolSetPoint"))
+        except (TypeError, ValueError):
+            cool = None
+        try:
+            heat = float(manual.get("autoHeatSetPoint"))
+        except (TypeError, ValueError):
+            heat = None
+
+        if cool is not None and current >= cool - 0.5:
+            return HVACAction.COOLING
+        if heat is not None and current <= heat + 0.5:
+            return HVACAction.HEATING
+        return HVACAction.IDLE
+
     def _ct01_set_previous_mode(self, mode_num: int) -> None:
         """Persist previous mode in both key styles used by CT01 payloads."""
         prefs = self._get_ct01_prefs()
@@ -1212,21 +1278,21 @@ class CieloHomeDevice:
         if power:
             if command_mode == 0:
                 command_mode = self._ct01_current_non_off_mode()
-            prefs["equipmentPower"] = "on"
             prefs["mode"] = command_mode
             self._ct01_set_previous_mode(command_mode)
             self._device["latestAction"]["power"] = "on"
+            self._device["latestAction"].setdefault("equipment_power", "off")
             self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
                 command_mode, "auto"
             )
         else:
             previous_mode = self._ct01_current_non_off_mode()
-            prefs["equipmentPower"] = "off"
             prefs["mode"] = 0
             self._ct01_set_previous_mode(previous_mode)
             self._device["latestAction"]["power"] = "off"
+            self._device["latestAction"]["equipment_power"] = "off"
             self._device["latestAction"]["mode"] = self._CT01_NUM_TO_MODE.get(
-                previous_mode, "auto"
+                0, "off"
             )
             command_mode = 0
 
@@ -1327,15 +1393,19 @@ class CieloHomeDevice:
 
         # CT01 StateUpdate has equipment_power, mode (numeric), manual_settings
         if "equipment_power" in action:
-            power = action["equipment_power"]
-            self._device["latestAction"]["power"] = power
-            self._old_power = power
-
             mode_num = action.get("mode", 0)
             if isinstance(mode_num, (int, str)):
                 mode_num = int(mode_num)
                 mode_str = self._CT01_NUM_TO_MODE.get(mode_num, "auto")
                 self._device["latestAction"]["mode"] = mode_str
+            else:
+                mode_num = 0
+
+            equipment_power = action["equipment_power"]
+            control_power = "off" if mode_num == 0 else "on"
+            self._device["latestAction"]["power"] = control_power
+            self._device["latestAction"]["equipment_power"] = equipment_power
+            self._old_power = control_power
 
             # Update target temp from manual_settings
             manual = action.get("manual_settings", {})
@@ -1358,7 +1428,7 @@ class CieloHomeDevice:
 
             # Persist preferences so _build_ct01_action_string stays current
             prefs = self._device.get("preferences", {})
-            prefs["equipmentPower"] = power
+            prefs["equipmentPower"] = equipment_power
             prefs["mode"] = mode_num
             prefs.update({
                 k: action[k] for k in (
