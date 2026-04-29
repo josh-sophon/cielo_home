@@ -509,7 +509,7 @@ class CieloHome:
         _LOGGER.info(
             "CT01 thermostat '%s' adapted: power=%s mode=%s temp=%s",
             device.get("deviceName", "?"),
-            power,
+            control_power,
             mode_str,
             target_str,
         )
